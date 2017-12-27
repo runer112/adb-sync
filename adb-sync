@@ -18,6 +18,7 @@
 
 from __future__ import unicode_literals
 import argparse
+from datetime import datetime
 import glob
 import locale
 import os
@@ -26,6 +27,10 @@ import stat
 import subprocess
 import sys
 import time
+
+
+tzdelta = datetime.utcfromtimestamp(0) - datetime.fromtimestamp(0)
+tzdelta = tzdelta.total_seconds()
 
 
 def _sprintf(s, *args):
@@ -146,23 +151,25 @@ class AdbFileSystem(object):
     if groups['S_IFSOCK']: st_mode |= stat.S_IFSOCK
     st_size = groups['st_size']
     if st_size is not None:
-      st_size = int(st_size)
+      st_size = long(st_size)
     if groups['st_mtime']:
       st_mtime = time.mktime(time.strptime(match.group('st_mtime'),
                                            '%Y-%m-%d %H:%M'))
     else:
       st_mtime = time.mktime(time.strptime(match.group('st_mtimefull'),
                                            '%a %b %d %H:%M:%S %Y'))
+    st_mtime -= tzdelta
+    st_mtime = long(st_mtime)
 
     # Fill the rest with dummy values.
-    st_ino = 1
-    st_rdev = 0
+    st_ino = 1L
+    st_dev = 0L
     st_nlink = 1
     st_uid = -2  # Nobody.
     st_gid = -2  # Nobody.
     st_atime = st_ctime = st_mtime
 
-    stbuf = os.stat_result((st_mode, st_ino, st_rdev, st_nlink, st_uid, st_gid,
+    stbuf = os.stat_result((st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid,
                             st_size, st_atime, st_mtime, st_ctime))
     filename = groups['filename']
     return stbuf, filename
@@ -309,7 +316,7 @@ class AdbFileSystem(object):
 
   def Pull(self, src, dst):
     """Pull a file from the Android device to the local file system."""
-    if subprocess.call(self.adb + [b'pull', src, dst]) != 0:
+    if subprocess.call(self.adb + [b'pull', b'-a', src, dst]) != 0:
       raise OSError('pull failed')
 
 
@@ -356,12 +363,16 @@ def DiffLists(a, b):
 
   Returns:
     a_only: the items from list a.
-    both: the items from both list, with the remaining tuple items combined.
+    a_newer: the items from both lists with a newer modification time in list a.
+    both: the items from both lists with equal modification times in both lists.
+    b_newer: the items from both lists with a newer modification time in list b.
     b_only: the items from list b.
   """
   a_only = []
-  b_only = []
+  a_newer = []
   both = []
+  b_newer = []
+  b_only = []
 
   a_iter = iter(a)
   b_iter = iter(b)
@@ -388,7 +399,21 @@ def DiffLists(a, b):
         b_active = False
         break
     if a_item[0] == b_item[0]:
-      both.append(tuple([a_item[0]] + list(a_item[1:]) + list(b_item[1:])))
+      a_stat = a_item[1]
+      b_stat = b_item[1]
+      a_mtime = long(a_stat.st_mtime)
+      b_mtime = long(b_stat.st_mtime)
+      combined_item = tuple([a_item[0]] + list(a_item[1:]) + list(b_item[1:]))
+      if (a_mtime == b_mtime or
+          stat.S_ISDIR(a_stat.st_mode) or
+          stat.S_ISDIR(b_stat.st_mode)):
+        both.append(combined_item)
+      elif a_mtime < b_mtime:
+        b_newer.append(combined_item)
+      elif a_mtime > b_mtime:
+        a_newer.append(combined_item)
+      else:
+        raise
       a_available = False
       b_available = False
     elif a_item[0] < b_item[0]:
@@ -411,7 +436,7 @@ def DiffLists(a, b):
     for item in b_iter:
       b_only.append(item)
 
-  return a_only, both, b_only
+  return a_only, a_newer, both, b_newer, b_only
 
 
 class FileSyncer(object):
@@ -445,8 +470,11 @@ class FileSyncer(object):
     _print(b'Scanning and diffing...')
     locallist = BuildFileList(os, self.local)
     remotelist = BuildFileList(self.adb, self.remote)
-    self.local_only, self.both, self.remote_only = DiffLists(locallist,
-                                                             remotelist)
+    self.local_only, self.local_newer, self.both, self.remote_newer, self.remote_only = DiffLists(locallist, remotelist)
+    for name, local_st, remote_st in self.local_newer:
+      self.local_only.append((name, local_st))
+    for name, local_st, remote_st in self.remote_newer:
+      self.remote_only.append((name, remote_st))
     if not self.local_only and not self.both and not self.remote_only:
       _print(b'No files seen. User error?')
     self.src_to_dst = (self.local_to_remote, self.remote_to_local)
