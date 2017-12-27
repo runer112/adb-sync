@@ -311,6 +311,8 @@ class AdbFileSystem(object):
 
   def Push(self, src, dst):
     """Push a file from the local file system to the Android device."""
+    if subprocess.call(self.adb + [b'shell', b'touch', dst]) != 0:
+      raise OSError('touch before push failed')
     if subprocess.call(self.adb + [b'push', src, dst]) != 0:
       raise OSError('push failed')
 
